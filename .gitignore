@@ -1,0 +1,32 @@
+# Go
+*.exe
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+dist/
+.npm
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docker
+*.tar
+
+# Secrets
+*.pem
+*.key
+*.crt
