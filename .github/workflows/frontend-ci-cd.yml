@@ -1,0 +1,140 @@
+name: Frontend CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths: ['frontend/**', '.github/workflows/frontend-ci-cd.yml']
+  pull_request:
+    branches: [main]
+    paths: ['frontend/**']
+
+env:
+  NODE_VERSION: '20'
+  WORKING_DIR: './frontend'
+
+jobs:
+  # ── Build & Test ──────────────────────────────────────────────────────────────
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm ci
+
+      - name: Run ESLint
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm run lint
+
+      - name: Security audit
+        working-directory: ${{ env.WORKING_DIR }}
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Build production bundle
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+        run: npm run build
+
+      - name: Verify build output
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "Build failed - dist directory not found"
+            exit 1
+          fi
+          echo "Build successful. Files:"
+          ls -lh dist/
+          echo "Total size: $(du -sh dist/ | cut -f1)"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: ${{ env.WORKING_DIR }}/dist
+          retention-days: 1
+
+  # ── Deploy to S3 ──────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to S3 + Invalidate CloudFront
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ./dist
+
+      - name: Sync to S3
+        run: |
+          # HTML files - no cache (always fresh)
+          aws s3 sync ./dist s3://${{ secrets.FRONTEND_BUCKET_NAME }} \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --delete
+
+          # Hashed assets - long cache
+          aws s3 sync ./dist s3://${{ secrets.FRONTEND_BUCKET_NAME }} \
+            --exclude "*.html" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --delete
+
+          echo "Sync complete."
+
+      - name: Invalidate CloudFront cache
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "CloudFront invalidation created: $INVALIDATION_ID"
+          echo "Waiting for invalidation to complete..."
+          aws cloudfront wait invalidation-completed \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --id $INVALIDATION_ID
+          echo "Invalidation complete."
+
+      - name: Smoke test deployment
+        run: |
+          CLOUDFRONT_URL="https://${{ secrets.CLOUDFRONT_DOMAIN }}"
+          echo "Testing $CLOUDFRONT_URL ..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$CLOUDFRONT_URL")
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Smoke test FAILED. HTTP $HTTP_CODE from CloudFront"
+            exit 1
+          fi
+          echo "Smoke test passed (HTTP $HTTP_CODE)"
+
+      - name: Write deployment summary
+        run: |
+          echo "## Frontend Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: https://${{ secrets.CLOUDFRONT_DOMAIN }}" >> $GITHUB_STEP_SUMMARY
