@@ -3,11 +3,14 @@ name: Backend CI/CD
 on:
   push:
     branches: [main, develop]
-    paths: ["backend/**", ".github/workflows/backend-ci-cd.yml"]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci-cd.yml"
 
   pull_request:
     branches: [main]
-    paths: ["backend/**"]
+    paths:
+      - "backend/**"
 
 env:
   GO_VERSION: "1.22"
@@ -16,13 +19,16 @@ env:
   WORKING_DIR: "./backend/MuchToDo"
 
 jobs:
-  # ── Test & Quality ─────────────────────────────────────────────────────
+  # ──────────────────────────────────────────────────────────────────────
+  # Test & Quality
+  # ──────────────────────────────────────────────────────────────────────
   test:
     name: Test & Quality
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -38,14 +44,20 @@ jobs:
         working-directory: ${{ env.WORKING_DIR }}
         run: |
           go mod tidy
-          git diff --exit-code go.mod go.sum || (echo "go.mod not tidy, run 'go mod tidy'" && exit 1)
+          git diff --exit-code go.mod go.sum || (
+            echo "go.mod not tidy. Run 'go mod tidy'"
+            exit 1
+          )
 
       - name: Run unit tests with coverage
         working-directory: ${{ env.WORKING_DIR }}
         run: |
           go test -v -race -coverprofile=coverage.out ./... 2>&1 | tee test_output.txt
+
           go tool cover -html=coverage.out -o coverage.html
+
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
+
           echo "Total coverage: $COVERAGE"
           echo "coverage=$COVERAGE" >> $GITHUB_ENV
 
@@ -74,11 +86,14 @@ jobs:
           working-directory: ${{ env.WORKING_DIR }}
         continue-on-error: true
 
-  # ── Build Docker Image ────────────────────────────────────────────────
+  # ──────────────────────────────────────────────────────────────────────
+  # Build & Push Docker Image
+  # ──────────────────────────────────────────────────────────────────────
   build:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
     needs: test
+
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     outputs:
@@ -86,7 +101,8 @@ jobs:
       image_uri: ${{ steps.meta.outputs.image_uri }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -107,7 +123,6 @@ jobs:
 
           echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
           echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
-          echo "registry=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -149,7 +164,9 @@ jobs:
 
           echo "Pushed: ${{ steps.meta.outputs.image_uri }}"
 
-  # ── Deploy to EC2 via ASG Rolling Update ──────────────────────────────
+  # ──────────────────────────────────────────────────────────────────────
+  # Deploy
+  # ──────────────────────────────────────────────────────────────────────
   deploy:
     name: Deploy to EC2 via ASG Rolling Update
     runs-on: ubuntu-latest
@@ -157,7 +174,8 @@ jobs:
     environment: production
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -166,12 +184,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update Launch Template to use new image
+      # ──────────────────────────────────────────────────────────────
+      # Create new Launch Template version
+      # ──────────────────────────────────────────────────────────────
+      - name: Update Launch Template
         id: update_lt
         run: |
           set -e
 
-          # Get Launch Template ID from ASG
+          # Get Launch Template ID
           LT_ID=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "${{ secrets.ASG_NAME }}" \
             --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' \
@@ -179,7 +200,7 @@ jobs:
 
           echo "Launch Template ID: $LT_ID"
 
-          # Get latest launch template version
+          # Get latest version
           LATEST_VERSION=$(aws ec2 describe-launch-templates \
             --launch-template-ids "$LT_ID" \
             --query 'LaunchTemplates[0].LatestVersionNumber' \
@@ -187,16 +208,20 @@ jobs:
 
           echo "Latest Version: $LATEST_VERSION"
 
-          # Validate version exists
-          if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "None" ]; then
-            echo "ERROR: Failed to fetch latest launch template version"
-            exit 1
-          fi
+          # Export current launch template data
+          aws ec2 describe-launch-template-versions \
+            --launch-template-id "$LT_ID" \
+            --versions "$LATEST_VERSION" \
+            --query 'LaunchTemplateVersions[0].LaunchTemplateData' \
+            --output json > lt-data.json
 
-          # Create new launch template version
+          cat lt-data.json
+
+          # Create new version
           NEW_VERSION=$(aws ec2 create-launch-template-version \
             --launch-template-id "$LT_ID" \
             --source-version "$LATEST_VERSION" \
+            --launch-template-data file://lt-data.json \
             --version-description "deploy-${{ github.sha }}" \
             --query 'LaunchTemplateVersion.VersionNumber' \
             --output text)
@@ -206,13 +231,20 @@ jobs:
           echo "lt_id=$LT_ID" >> $GITHUB_OUTPUT
           echo "lt_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
-      - name: Update ASG to latest Launch Template version
+      # ──────────────────────────────────────────────────────────────
+      # Point ASG to latest LT version
+      # ──────────────────────────────────────────────────────────────
+      - name: Update ASG Launch Template Version
         run: |
           aws autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --launch-template "LaunchTemplateId=${{ steps.update_lt.outputs.lt_id }},Version=${{ steps.update_lt.outputs.lt_version }}"
+            --launch-template \
+            "LaunchTemplateId=${{ steps.update_lt.outputs.lt_id }},Version=${{ steps.update_lt.outputs.lt_version }}"
 
-      - name: Trigger ASG Instance Refresh
+      # ──────────────────────────────────────────────────────────────
+      # Rolling deployment
+      # ──────────────────────────────────────────────────────────────
+      - name: Start Instance Refresh
         id: refresh
         run: |
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
@@ -221,22 +253,24 @@ jobs:
             --preferences '{
               "MinHealthyPercentage": 50,
               "InstanceWarmup": 60,
-              "CheckpointPercentages": [50, 100],
+              "CheckpointPercentages": [50,100],
               "CheckpointDelay": 30
             }' \
             --query 'InstanceRefreshId' \
             --output text)
 
-          echo "Instance refresh started: $REFRESH_ID"
+          echo "Refresh ID: $REFRESH_ID"
+
           echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
 
-      - name: Wait for rolling deploy to complete
+      - name: Wait for deployment
         run: |
           REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
 
           echo "Monitoring refresh: $REFRESH_ID"
 
           for i in $(seq 1 40); do
+
             STATUS=$(aws autoscaling describe-instance-refreshes \
               --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
               --instance-refresh-ids "$REFRESH_ID" \
@@ -249,16 +283,16 @@ jobs:
               --query 'InstanceRefreshes[0].PercentageComplete' \
               --output text 2>/dev/null || echo "0")
 
-            echo "[$i/40] Status: $STATUS | Progress: ${PCT}%"
+            echo "[$i/40] Status=$STATUS Progress=${PCT}%"
 
             case "$STATUS" in
               Successful)
-                echo "Deploy succeeded!"
-                break
+                echo "Deployment successful"
+                exit 0
                 ;;
 
               Failed|Cancelled)
-                echo "Deploy $STATUS. Rolling back..."
+                echo "Deployment failed"
 
                 aws autoscaling rollback-instance-refresh \
                   --auto-scaling-group-name "${{ secrets.ASG_NAME }}" || true
@@ -270,43 +304,44 @@ jobs:
             sleep 30
           done
 
-          FINAL=$(aws autoscaling describe-instance-refreshes \
-            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
-            --instance-refresh-ids "$REFRESH_ID" \
-            --query 'InstanceRefreshes[0].Status' \
-            --output text)
+          echo "Deployment timed out"
+          exit 1
 
-          if [ "$FINAL" != "Successful" ]; then
-            echo "Timed out waiting for refresh (status: $FINAL)"
-            exit 1
-          fi
-
+      # ──────────────────────────────────────────────────────────────
+      # Health check
+      # ──────────────────────────────────────────────────────────────
       - name: Health check via ALB
         run: |
           ALB_URL="http://${{ secrets.ALB_DNS_NAME }}"
 
-          echo "Running health checks against $ALB_URL ..."
+          echo "Running health checks against $ALB_URL"
 
           for i in $(seq 1 10); do
-            HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "$ALB_URL/health" || echo "000")
+
+            HTTP_CODE=$(curl -sf -o /dev/null \
+              -w "%{http_code}" \
+              "$ALB_URL/health" || echo "000")
 
             echo "Attempt $i: HTTP $HTTP_CODE"
 
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed."
+              echo "Health check passed"
               exit 0
             fi
 
             sleep 10
           done
 
-          echo "Health check failed after 10 attempts."
+          echo "Health check failed"
           exit 1
 
+      # ──────────────────────────────────────────────────────────────
+      # Deployment Summary
+      # ──────────────────────────────────────────────────────────────
       - name: Write deployment summary
         run: |
           echo "## Backend Deployment" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ needs.build.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **ASG**: \`${{ secrets.ASG_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Strategy**: Rolling update (50% min healthy)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deployed by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${{ needs.build.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- ASG: \`${{ secrets.ASG_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Strategy: Rolling Update" >> $GITHUB_STEP_SUMMARY
+          echo "- Actor: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
