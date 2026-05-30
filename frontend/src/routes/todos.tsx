@@ -26,7 +26,8 @@ function Todos() {
         queryKey: ['todos'],
         queryFn: async () => {
             const response = await apiClient.get('/tasks');
-            return response.data as Todo[];
+            // ensure we always return an array
+            return Array.isArray(response.data) ? response.data : [];
         },
         enabled: !!user,
     });
