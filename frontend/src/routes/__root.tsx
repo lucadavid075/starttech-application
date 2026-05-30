@@ -3,6 +3,7 @@ import { TanStackRouterDevtools } from '@tanstack/react-router-devtools'
 import { useAuth } from '@/hooks/useAuth'
 import { LogOut, CheckSquare, Menu, X } from 'lucide-react'
 import { useState } from 'react'
+import { setAuthToken } from '@/lib/apiClient';
 
 const RootLayout = () => {
     const { logout, isAuthenticated } = useAuth()
@@ -10,6 +11,7 @@ const RootLayout = () => {
     const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
 
     const handleLogout = () => {
+        setAuthToken(null);
         logout()
         setMobileMenuOpen(false)
         navigate({ to: '/login' })
